@@ -1,9 +1,4 @@
 # SoDA-501
 Final Project
 
-You can find the documents for our final project here.
-
-Three parts:
-1. Data scraping
-2. Natural language processing
-3. Network visualization
+You can find the scripts and plots from our network analysis for our final project here. This code is written in R.
