@@ -6,9 +6,9 @@
 This repository contains code to scrape press releases from state GOP party websites from 2013-2018 (when available). The scripts are written in Python and rely heavily on BeautifulSoup and Selenium. The scripts produce .txt files with the following format:
 <br />
 
-  * * Press Release Title <br />
-  * * Press Release Date  <br />
-  * * Press Release Contents
+  *Press Release Title* <br />
+  *Press Release Date*  <br />
+  *Press Release Contents*
  <br />
  
  The files are written in UTF-8 encoding. It should be noted that running these scripts at different times will produce slightly different data. This occurs because the script specifies pages to scrape from, and which pages press releases are located will change as more press releases are added.
