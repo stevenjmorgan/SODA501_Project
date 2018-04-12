@@ -8,7 +8,6 @@ This repository contains code to scrape press releases from state GOP party webs
 
   Press Release Title <br />
   Press Release Date
-
   Press Release Contents
  <br />
  
