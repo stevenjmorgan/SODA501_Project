@@ -6,164 +6,259 @@ author: "Steve, Fangcao, Lulu, & Omer"
 output: html_notebook
 ---
 
-### 1. Read in Data
+### 1. Reading in Data & Creating Edgelists
 
 ```{r}
-# read in json file
-# install.packages("jsonlite")
+#install.packages("jsonlite")
 library(jsonlite)
 library(tidyverse)
 
-json1 <- "NoContentForLulu0.json"
-json2 <- "NoContentForLulu1.json"
-data1 <- jsonlite::fromJSON(json1, flatten = TRUE)
-data2 <- jsonlite::fromJSON(json2, flatten = TRUE)
-data <- rbind(data1, data2)
+# read in json file
+dat <- jsonlite::fromJSON("Json_04-15.json", flatten = TRUE)
 
-p_lst <- data$PERSON
-people <- unlist(p_lst)
-# freq <- sort(table(people), decreasing = T) # count the frequency of occurrences of each person
-# head(freq, n = 50L) # take a look at people ranked top 50 
-p_nodes <- sort(unique(people)) %>% 
-        cbind(., rep("p", length(.))) %>%
-        `colnames<-`(c("label", "type")) %>%
-        as.data.frame
-# write.table(p_nodes, "p_nodes.txt")
+# Remove non-alphanumeric characters and Leading/Trailing Whitespace
+trimming <- function(lst) {
+  lst <- gsub("[^[:alnum:][:space:]]", "", lst)
+  lst <- gsub("^\\s+|\\s+$","",lst)
+}
 
-org_lst <- data$ORGANIZATION
-orgs <- unlist(org_lst)
-# freq2 <- sort(table(orgs), decreasing = T)
-# head(freq2, n = 50L)
-org_nodes <- sort(unique(orgs)) %>% 
-        cbind(., rep("o", length(.))) %>%
-        `colnames<-`(c("label", "type")) %>%
-        as.data.frame
-# write.table(org_nodes, "org_nodes.txt")
-# combine the lists of people and orgs
-p_org <- mapply(c, p_lst, org_lst, SIMPLIFY=FALSE)
+## Locations
+l_lst <- unnest(dat,LOCATION,.drop = NA,.id = "orig_rn")
 
-# create a vector to show the type of nodes (used in visualization)
-nodes <- rbind(p_nodes, org_nodes) %>% 
-        distinct(label, .keep_all = TRUE)
+## People
+p_lst <- unnest(dat,PERSON,.drop = NA,.id = "orig_rn") %>%
+        `colnames<-`(c("node","orig_rn")) %>% 
+        cbind(., label=rep("people",nrow(.)))
+p_lst$node <- trimming(p_lst$node)
+p_lst$node[p_lst$node =="Obama"]= "Barack Obama"
+p_lst$node[p_lst$node =="Trump" | p_lst$node =="Donald J Trump"]= "Donald Trump"
+# remove nodes that contain certain stop words & that are longer than three word counts
+# also remove unigrams b/c they are mostly unidentifiable
+p_lst <- p_lst[
+        !grepl("Obamacare|Said|Gave|Took|Assessing|Under|God", p_lst$node) 
+        & !(sapply(gregexpr("\\S+", p_lst$node), length) > 3)
+        & !(sapply(gregexpr("\\S+", p_lst$node), length) == 1),]
+p_nodes <- unique(p_lst[,-2])
 
-save(p_nodes, org_nodes, nodes, file = "nodes.RData")
+## Organizations
+o_lst <- unnest(dat,ORGANIZATION,.drop = NA,.id = "orig_rn") %>%
+        `colnames<-`(c("node","orig_rn")) %>% 
+        cbind(., label=rep("organization",nrow(.)))
+o_lst$node <- trimming(o_lst$node)
+o_lst$node[o_lst$node =="The New York Times"]= "New York Times"
+o_lst$node[o_lst$node =="The Washington Post"]= "Washington Post"
+o_nodes <- unique(o_lst[,-2])
 
-# which rows are repetitive?
-duplicate_rows <- nodes[which(duplicated(nodes$name)==TRUE),]
-write.table(duplicate_rows, "duplicate_rows.txt")
+# do(): apply the expression to each group
+# n(): number of observations in the current group.
+p_edgelist <- p_lst %>% 
+        group_by(orig_rn) %>% 
+        filter(n() > 2) %>% 
+        do(data.frame(t(combn(.$node,2))))
+o_edgelist <- o_lst %>% 
+        group_by(orig_rn) %>% 
+        filter(n() > 2) %>% 
+        do(data.frame(t(combn(.$node,2))))
+weighted_p <- p_edgelist[,-1] %>% 
+        group_by(X1,X2) %>% 
+        dplyr::summarise(weight = n())
+head(weighted_p, 10) # take a look
+weighted_o <- o_edgelist[,-1] %>% 
+        group_by(X1,X2) %>% 
+        dplyr::summarise(weight = n())
+        
+save(p_nodes, o_nodes, file = "nodes.RData")
+save(weighted_p, weighted_o, file = "edgelists.RData")
+
 ```
 
-### 2. Co-occurrence Matrix
+### 2. Press Release Map
 
 ```{r}
-## a function for constructing co-occurrence matrix ##
-# argument = a list of people/orgs mentioned in press releases
-adj_mat <-function(lst) {
-        nodes <- sort(unique(unlist(lst))) # extract unique nodes
-        n_nodes <- length(nodes) # number of nodes
-        mat <- matrix(NA, nrow = n_nodes, ncol = n_nodes) # an empty matrix to store values of co-occurrence
-        for (i in 1:n_nodes) {
-                # whether a vector contains i
-                find_i <- lapply(lst, function(x) which(x == nodes[i]))
-                # which vectors contain i
-                position_i <- sapply(find_i, function(x) length(x) > 0)
-                subset <- lst[position_i]
-                # subsetting p.list
-                for (j in 1:n_nodes) {
-                        # find j in p.subset
-                        find_j <- lapply(subset, function(x) which(x == nodes[j]))
-                        position_j <- sapply(find_j, function(x) length(x) > 0)
-                        n_co <- length(which(position_j)) # gives number of co-occurrence
-                        mat[i, j] <- n_co
-                }
-                mat[i, i] <- 0 # diagnal = 0
-        }
-        return(mat)
-}        
-
-# adjacency matrix for people
-system.time(p_mat <- adj_mat(p_lst))
-
-# adjacency matrix for orgs 
-system.time(org_mat <- adj_mat(org_lst))
-
-# adjacency matrix for people and orgs combined
-system.time(p_org_mat <- adj_mat(p_org))
-
-save(p_mat, org_mat, p_org_mat, file = "AdjMat.RData")
+# Fangcao, you may want to insert your code here
 
 ```
 
 ### 3. Network Visualization
+#### 3.1 Plotting Networks
 
 ```{r}
 rm(list = ls())
 load("nodes.RData")
-load("AdjMat.RData")
+load("edgelists.RData")
 library(igraph)
 # install.packages("qgraph")
 library(qgraph)
+library(dplyr)
 
-## a function for computing nodal attributes ##
-node_attr <- function(nodes, graph) {
+## function for computing nodal attributes ##
+node_attr <- function(graph) {
         degree <- degree(graph)
         strength <- strength(graph) # weighted vertex degree
         btw <- betweenness(graph)
         closeness <- closeness(graph)
         eigen <- eigen_centrality(graph)$vector
-        node_attr <- data.frame(nodes, degree, strength, 
-                                btw, closeness, eigen,
-                                stringsAsFactors = FALSE)
-        
-        return(node_attr)
+        pr <- page.rank(graph)$vector
+        attr <- data.frame(degree, strength,
+                          btw, closeness, eigen, 
+                          pr, stringsAsFactors = FALSE)
+        attr <- rownames_to_column(attr, var = "name")
+        return(attr)
 }
 
-plot1 <- function(g, attr) {
+## function for plotting graphs ##
+plot_graph <- function(graph, scale, name = NA) {
         set.seed(04112018)
-        e <- get.edgelist(g)
-        l <- qgraph.layout.fruchtermanreingold(e,vcount=vcount(g), 
-                area=8*(vcount(g)^2),repulse.rad=(vcount(g)^3.1))
-        #lo <- qgraph.layout.fruchtermanreingold(e,vcount=vcount(g))
-        #lo <- layout.fruchterman.reingold(g, repulserad = vcount(g)^2.8, area = vcount(g)^2.3, niter = 1000)
+        e <- get.edgelist(graph, names = FALSE)
+        l <- qgraph.layout.fruchtermanreingold(e,vcount=vcount(graph), 
+                area=8*(vcount(graph)^2),repulse.rad=(vcount(graph)^3.1))
         plot <- plot(
-                g, 
-                vertex.size = log(attr$degree+1),
-                vertex.label = NA, # attr$label
-                vertex.color = c("lightseagreen", "lightsalmon")[(attr$type=="o") +1],
-                #vertex.label.cex = 0.5,
-                #vertex.label.dist=1.5,
-                vertex.shape = c("circle", "square")[(attr$type=="o") +1],
-                edge.size = 0.2*E(g)$weight,
-                layout = l
-            )
+                graph, 
+                vertex.size = ifelse(V(graph)$label == "place", 0.1*degree(graph), scale*degree(graph)),
+                vertex.label = name, 
+                vertex.label.cex = 0.5,
+                vertex.label.dist = 0.6,
+                vertex.label.degree= pi/2,
+                vertex.color = c("lightseagreen","red")[(V(graph)$label=="organization") +1],
+                vertex.shape = c("circle","square")[(V(graph)$label=="organization") +1],
+                vertex.frame.color = "gray30",
+                edge.width = 0.1*E(graph)$weight,
+                layout=l
+                )
         return(plot)
 }
 
-g <- graph_from_adjacency_matrix(
-        p_mat, mode = "undirected", weighted = TRUE)
-# tran <- transitivity(g)
-p_attr <- node_attr(p_nodes, g)       
-pdf(file="plot1.pdf")
-p1 <- plot1(g, p_attr)
+# generating graphs from edgelists
+p_graph <- igraph::simplify(graph_from_data_frame(weighted_p,directed=FALSE,vertices = p_nodes))
+o_graph <- graph_from_data_frame(weighted_o,directed=FALSE,vertices = o_nodes)
+# computing nodal attributes
+p_attr <- node_attr(p_graph)
+o_attr <- node_attr(o_graph)
+
+## plotting
+g1 <- delete.vertices(p_graph, degree(p_graph) == 0)
+
+# mean degree as threshold
+threshold2 <- mean(p_attr$degree)
+g2 <- delete.vertices(p_graph, degree(p_graph) <= threshold2)
+
+# mean + 1SD as threshold
+threshold3 <- mean(p_attr$degree) + sd(p_attr$degree)
+g3 <- delete.vertices(p_graph, degree(p_graph) <= threshold3)
+
+# mean + 2SD as threshold
+threshold4 <- mean(p_attr$degree) + 2*sd(p_attr$degree)
+g4 <- delete.vertices(p_graph, degree(p_graph) <= threshold4)
+
+pdf(file="people_co-occurrence.pdf")
+plot_graph(g1, 0.03)
+title(main = "The Co-occurrence Network for People", sub = "Threshold: Degree Centrallity > 0")
+
+plot_graph(g2, 0.05)
+title(main = "The Co-occurrence Network for People", sub = "Threshold: Degree Centrallity > Mean(Degree)")
+
+plot_graph(g3, 0.08)
+title(main = "The Co-occurrence Network for People", sub = "Threshold: Degree Centrallity > Mean(Degree) + 1SD(Degree)")
+
+plot_graph(g4, 0.2, V(g4)$name)
+title(main = "The Co-occurrence Network for People", sub = "Threshold: Degree Centrallity > Mean(Degree) + 2SD(Degree)")
+dev.off()
+```
+#### 3.2 Community Detection
+
+```{r}
+library(dplyr)
+library(igraph)
+library(qgraph)
+#install.packages("colorspace")
+library(colorspace)
+
+## function to plot communities w/ different colors
+plot_cl <- function(graph, clusters, name = NA) {
+        # generate colors to represent different communities
+        colrs <- rainbow_hcl(length(clusters))
+        # turn membership into a nodal attribute
+        V(graph)$membership <- membership(clusters)
+        
+        set.seed(04112018)
+        e <- get.edgelist(graph, names = FALSE)
+        l <- qgraph.layout.fruchtermanreingold(e,vcount=vcount(graph), area=8*(vcount(graph)^2),repulse.rad=(vcount(graph)^3.1))
+        plot <- plot(
+                graph, 
+                vertex.size = log2(20000*page_rank(graph)$vector),
+                vertex.label = name,
+                vertex.color = colrs[V(graph)$membership],
+                vertex.label.cex = 0.5,
+                vertex.label.dist=1.5,
+                vertex.shape = c("circle", "square")[(V(graph)$label=="organization") +1],
+                edge.width = 0.1*E(graph)$weight,
+                layout = l
+            )
+        legend("topleft",
+               legend=1:length(clusters),
+               pt.bg=colrs,
+               pch= rep(21, length(clusters)),
+               cex = 0.75,
+               pt.cex = 1.5,
+               ncol = 4,
+               title = "Community")
+        return(plot)
+}
+
+#### Community Detection ####
+## walktrap 
+cl_wt <- walktrap.community(g2, weights = E(g2)$weight, steps = 3)
+
+## fastgreedy
+cl_fg <- fastgreedy.community(g2, weights = E(g2)$weight)
+
+## spinglass
+cl_sg <- spinglass.community(g2, weights = E(g2)$weight)
+
+## leading.eigenvector
+cl_eigen <- leading.eigenvector.community(g2, weights = E(g2)$weight)
+
+## infomap
+cl_info <- infomap.community(g2, e.weights = E(g2)$weight)
+
+## save the plots
+pdf("p_communities.pdf")
+plot_cl(g2, cl_wt,
+        # display labels for nodes w/ high betweenness
+        ifelse(betweenness(g2) >= 10000, V(g2)$name, NA))
+title(main = "Communities Identified by the Walktrap Algorithm")
+
+plot_cl(g2, cl_fg,
+        ifelse(betweenness(g2) >= 10000, V(g2)$name, NA))
+title(main = "Communities Identified by the Fast Greedy Algorithm")
+
+plot_cl(g2, cl_sg,
+        ifelse(betweenness(g2) >= 10000, V(g2)$name, NA))
+title(main = "Communities Identified by the Spinglass Algorithm")
+
+plot_cl(g2, cl_eigen,
+        ifelse(betweenness(g2) >= 10000, V(g2)$name, NA))
+title(main = "Communities Identified by the Leading Eigenvector Algorithm")
+
+plot_cl(g2, cl_info,
+        ifelse(betweenness(g2) >= 10000, V(g2)$name, NA))
+title(main = "Communities Identified by the Infomap Algorithm")
 dev.off()
 
-g2 <- delete.vertices(g, degree(g) == 0)
-p_attr2 <- dplyr::filter(p_attr, degree > 0)
-pdf(file="plot2.pdf")
-plot2 <- plot1(g2, p_attr2)
-dev.off()
-# rescale=F,axes=TRUE,ylim=c(0,6),xlim=c(0,1), asp = 0
+nodal_attr <- node_attr(g2) %>% 
+        mutate(walktrap = cl_wt$membership,
+               fastgreedy = cl_fg$membership,
+               spinglass = cl_sg$membership,
+               leading.eigenvector = cl_eigen$membership,
+               infomap = cl_info$membership) 
+write.csv(nodal_attr, "community identification.csv")
 
-g_combined <- graph_from_adjacency_matrix(p_org_mat, mode = "undirected", weighted = TRUE)
-combined_attr <-node_attr(nodes,g_combined)
-# graph including both people & orgs
-pdf(file="plot_both.pdf")
-plot2 <- plot1(g_combined, combined_attr)
-dev.off()
 
-g_org <- graph_from_adjacency_matrix(org_mat, mode = "undirected", weighted = TRUE)
-org_attr <- node_attr(org_nodes, g_org)
-pdf(file="plot_org.pdf")
-plot_org <- plot1(g_org, org_attr)
-dev.off()
+# cl_wt.g3 <- walktrap.community(g3, weights = E(g3)$weight, steps = 3)
+plot_cl(g3, cl_wt.g3,
+        ifelse(betweenness(g3) >= 50000, V(g3)$name, NA))
+
+# cl_wt.g4 <- walktrap.community(g4, weights = E(g4)$weight, steps = 3)
+plot_cl(g4, cl_wt.g4,V(g4)$name)
+
 ```
