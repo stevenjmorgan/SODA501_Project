@@ -1,0 +1,445 @@
+---
+title: "| SoDA 501 - Final Project\n| An Investigation of GOP Press Releases \n"
+author: "Steve, Fangcao, Lulu, & Omer"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+### 1. Reading in Data & Creating Edgelists
+
+```{r}
+# install.packages("jsonlite")
+library(jsonlite)
+library(tidyverse)
+
+# read in json file
+dat1 <- jsonlite::fromJSON("Json_04-15.json", flatten = TRUE)
+dat2 <- jsonlite::fromJSON("NodateJsonResult.json", flatten = TRUE)
+dat <- rbind(dat1, dat2)
+
+# Remove non-alphanumeric characters and Leading/Trailing Whitespace
+trimming <- function(lst) {
+        lst <- gsub("[^[:alnum:][:space:]]", "", lst)
+        lst <- gsub("^\\s+|\\s+$","",lst)
+}
+
+## Locations
+l_lst <- unnest(dat,LOCATION,.drop = NA,.id = "orig_rn")
+
+## People
+# press releases w/ more than 20 people are removed b/c they would bias the overall results
+dat_rm <- dat[!sapply(dat$PERSON, function(x) length(x) > 20),]
+p_lst <- unnest(dat_rm,PERSON,.drop = NA,.id = "orig_rn") %>%
+        `colnames<-`(c("node","orig_rn")) %>% 
+        cbind(., label=rep("people",nrow(.)))
+p_lst$node <- trimming(p_lst$node)
+p_lst$node[p_lst$node =="Obama"]= "Barack Obama"
+p_lst$node[p_lst$node =="Trump" | p_lst$node =="Donald J Trump"]= "Donald Trump"
+# remove nodes that contain certain stop words; only retain bigrams and trigrams
+p_lst <- p_lst[
+        !grepl("Obamacare|Said|Gave|Took|Assessing|Under|God", p_lst$node) 
+        & !(sapply(gregexpr("\\S+", p_lst$node), length) > 3)
+        & !(sapply(gregexpr("\\S+", p_lst$node), length) == 1),]
+p_nodes <- unique(p_lst[,-2])
+
+## Organizations
+o_lst <- unnest(dat,ORGANIZATION,.drop = NA,.id = "orig_rn") %>%
+        `colnames<-`(c("node","orig_rn")) %>% 
+        cbind(., label=rep("organization",nrow(.)))
+o_lst$node <- trimming(o_lst$node)
+o_lst$node[o_lst$node =="The New York Times"]= "New York Times"
+o_lst$node[o_lst$node =="The Washington Post"]= "Washington Post"
+o_nodes <- unique(o_lst[,-2])
+
+# Table join to original data set
+dat_copy <- dat1[,c(3,5,6)]
+dat_copy$orig_rn <- as.numeric(rownames(dat_copy))
+l_join <- inner_join(dat_copy,l_lst,by="orig_rn")
+
+# do(): apply the expression to each group
+# n(): number of observations in the current group.
+p_edgelist <- p_lst %>% 
+        group_by(orig_rn) %>% 
+        filter(n() > 2) %>% 
+        do(data.frame(t(combn(.$node,2))))
+o_edgelist <- o_lst %>% 
+        group_by(orig_rn) %>% 
+        filter(n() > 2) %>% 
+        do(data.frame(t(combn(.$node,2))))
+weighted_p <- p_edgelist[,-1] %>% 
+        group_by(X1,X2) %>% 
+        dplyr::summarise(weight = n())
+head(weighted_p, 10) # take a look
+weighted_o <- o_edgelist[,-1] %>% 
+        group_by(X1,X2) %>% 
+        dplyr::summarise(weight = n())
+
+save(p_nodes, o_nodes, file = "nodes.RData")
+save(weighted_p, weighted_o, file = "edgelists.RData")
+
+```
+
+### 2. Press Release Map
+
+```{r}
+# install.packages(c("sp", "rgdal", "raster", "maptools", "rgeos"))
+library(sp)
+library(rgdal)
+library(raster)
+library(ggplot2)
+library(maptools)
+library(rgeos)
+
+l_join$latitude <- sapply(strsplit(l_join$LOCATION, ","), function(x) as.numeric(rev(x)[2]))
+l_join$longitude <- sapply(strsplit(l_join$LOCATION, ","), function(x) as.numeric(rev(x)[1]))
+l_join$location <- sapply(strsplit(l_join$LOCATION, ","), function(x) paste(rev(rev(x)[-c(1,2)]),collapse = ","))
+l_join$simplify <- sapply(strsplit(l_join$LOCATION, ","), function(x) x[1])
+
+# Generate spatial points of the press releases
+crdref <- CRS('+proj=longlat +datum=WGS84')
+longlat <- cbind(l_join$longitude,l_join$latitude)
+pts <- SpatialPoints(longlat, crdref)
+ptsdf <- SpatialPointsDataFrame(pts, data=l_join[,-c(4,5,6,7)])
+
+# Crop the extent of United States
+extent <- extent(bbox(ptsdf))
+state <- crop(readOGR("cb_2017_us_state_5m","cb_2017_us_state_5m"),extent)
+state.t <- spTransform(state,crdref)
+
+ptsdf.df <- data.frame(ptsdf) 
+state.t@data$id <- rownames(state.t@data)
+state.points <- fortify(state.t, region="id")
+state.df <- dplyr::inner_join(state.points, state.t@data, by="id")
+file <- ggplot() + 
+        geom_polygon(data= state.df, aes(x=long,y=lat,group=group),colour='black',fill='white') +
+  labs(x="longitude", y="latitude", title="Spatial Distribution of GOP Press Releases") + 
+  theme(plot.title = element_text(hjust = 0.5)) +
+  geom_point(data = ptsdf.df, aes(x=coords.x1,y=coords.x2), colour = "lightseagreen", size = 0.5) +
+  geom_text(data = ptsdf.df,aes(x=coords.x1,y=coords.x2, label=unlist(ID)),size=1.5, hjust=-0.1, vjust=-0.7)
+ggsave("Spatial Distribution of Press Releases.pdf",file, width= 20, height=12.5,units="cm", dpi=300)
+```
+
+### 3. Network Visualization
+#### 3.1 Plotting Networks - People
+
+```{r}
+rm(list = ls())
+load("nodes.RData")
+load("edgelists.RData")
+library(igraph)
+# install.packages("qgraph")
+library(qgraph)
+library(tibble)
+
+## function for computing nodal attributes ##
+node_attr <- function(graph) {
+        degree <- degree(graph)
+        strength <- strength(graph) # weighted vertex degree
+        btw <- betweenness(graph)
+        closeness <- closeness(graph)
+        eigen <- eigen_centrality(graph)$vector
+        pr <- page.rank(graph)$vector
+        attr <- data.frame(degree, strength, 
+                                btw, closeness, eigen, pr,
+                                stringsAsFactors = FALSE)
+        attr <- rownames_to_column(attr, var = "name")
+        return(attr)
+}
+
+## function for plotting graphs ##
+plot_graph <- function(graph, scale, name = NA) {
+        set.seed(04112018)
+        e <- get.edgelist(graph, names = FALSE)
+        l <- qgraph.layout.fruchtermanreingold(e,vcount=vcount(graph), 
+                area=8*(vcount(graph)^2),repulse.rad=(vcount(graph)^3.1))
+        plot <- plot(
+                graph, 
+                vertex.size = ifelse(V(graph)$label == "place", 0.1*degree(graph), scale*degree(graph)),
+                vertex.label = name, 
+                vertex.label.cex = 0.5,
+                vertex.label.dist = 1,
+#                vertex.label.degree= pi/2,
+                vertex.color = c("lightseagreen","salmon")[(V(graph)$label=="organization") +1],
+                vertex.shape = c("circle","square")[(V(graph)$label=="organization") +1],
+                vertex.frame.color = "gray30",
+                edge.width = 0.1*E(graph)$weight,
+                layout=l
+                )
+        return(plot)
+}
+
+# generating graphs from edgelists
+p_graph <- igraph::simplify(graph_from_data_frame(weighted_p,directed=FALSE,vertices = p_nodes))
+# computing nodal attributes
+p_attr <- node_attr(p_graph)
+
+## plotting
+g1 <- delete.vertices(p_graph, degree(p_graph) == 0)
+
+# mean degree as threshold
+threshold2 <- mean(p_attr$degree)
+g2 <- delete.vertices(p_graph, degree(p_graph) <= threshold2)
+
+# mean + 1SD as threshold
+threshold3 <- mean(p_attr$degree) + sd(p_attr$degree)
+g3 <- delete.vertices(p_graph, degree(p_graph) <= threshold3)
+
+# mean + 2SD as threshold
+threshold4 <- mean(p_attr$degree) + 2*sd(p_attr$degree)
+g4 <- delete.vertices(p_graph, degree(p_graph) <= threshold4)
+
+pdf(file="people_co-occurrence.pdf")
+plot_graph(g1, 0.03)
+title(main = "The Co-occurrence Network for People", sub = "Threshold: Degree Centrality > 0")
+
+plot_graph(g2, 0.05)
+title(main = "The Co-occurrence Network for People", sub = "Threshold: Degree Centrality > Mean(Degree)")
+
+plot_graph(g3, 0.1, V(g3)$name)
+title(main = "The Co-occurrence Network for People", sub = "Threshold: Degree Centrality > Mean(Degree) + 1SD(Degree)")
+
+plot_graph(g4, 0.2, V(g4)$name)
+title(main = "The Co-occurrence Network for People", sub = "Threshold: Degree Centrality > Mean(Degree) + 2SD(Degree)")
+dev.off()
+```
+
+#### 3.2 Plotting Networks - Organizations
+
+```{r}
+o_graph <- graph_from_data_frame(weighted_o,directed=FALSE,vertices = o_nodes)
+# computing nodal attributes
+o_attr <- node_attr(o_graph)
+
+# remove isolates
+g1o <- delete.vertices(o_graph, degree(o_graph) == 0)
+
+# mean degree as threshold
+threshold2o <- mean(o_attr$degree)
+g2o <- delete.vertices(o_graph, degree(o_graph) <= threshold2o)
+
+# mean + 1SD as threshold
+threshold3o <- mean(o_attr$degree) + sd(o_attr$degree)
+g3o <- delete.vertices(o_graph, degree(o_graph) <= threshold3o)
+
+# mean + 2SD as threshold
+threshold4o <- mean(o_attr$degree) + 2*sd(o_attr$degree)
+g4o <- delete.vertices(o_graph, degree(o_graph) <= threshold4o)
+
+# mean + 1.5SD as threshold
+threshold5o <- mean(o_attr$degree) + 1.5*sd(o_attr$degree)
+g5o <- delete.vertices(o_graph, degree(o_graph) <= threshold5o)
+
+pdf(file="organization_co-occurrence.pdf")
+# plot_graph(g1o, 0.03)
+# title(main = "The Co-occurrence Network for Organizations", sub = "Threshold: Degree Centrality > 0")
+
+plot_graph(g2o, 0.05)
+title(main = "The Co-occurrence Network for Organizations", sub = "Threshold: Degree Centrality > Mean(Degree)")
+
+plot_graph(g3o, 0.08)
+title(main = "The Co-occurrence Network for Organizations", sub = "Threshold: Degree Centrality > Mean(Degree) + 1SD(Degree)")
+
+plot_graph(g4o, 0.1, V(g4o)$name)
+title(main = "The Co-occurrence Network for Organizations", sub = "Threshold: Degree Centrality > Mean(Degree) + 2SD(Degree)")
+dev.off()
+```
+
+#### 3.3 Community Detection - People
+
+```{r}
+library(dplyr)
+library(igraph)
+library(qgraph)
+#install.packages("colorspace")
+library(colorspace)
+
+# function to plot communities w/ different colors ##
+plot_cl <- function(graph, clusters, name = NA) {
+        # generate colors to represent different communities
+        colrs <- rainbow_hcl(length(clusters))
+        # turn membership into a nodal attribute
+        V(graph)$membership <- membership(clusters)
+        
+        set.seed(04112018)
+        e <- get.edgelist(graph, names = FALSE)
+        l <- qgraph.layout.fruchtermanreingold(e,vcount=vcount(graph), area=8*(vcount(graph)^2),repulse.rad=(vcount(graph)^3.1))
+        plot <- plot(
+                graph, 
+                vertex.size = log2(20000*page_rank(graph)$vector),
+                vertex.label = name,
+                vertex.color = colrs[V(graph)$membership],
+                vertex.label.cex = 0.5,
+                vertex.label.dist= 1,
+                vertex.shape = c("circle", "square")[(V(graph)$label=="organization") +1],
+                edge.width = 0.1*E(graph)$weight,
+                layout = l
+            )
+        legend("bottomleft",
+               legend=1:length(clusters),
+               pt.bg=colrs,
+               pch= rep(21, length(clusters)),
+               cex = 0.75,
+               pt.cex = 1.5,
+               ncol = 4,
+               title = "Community")
+        return(plot)
+}
+
+## identify clusters using walktrap algorithm
+# cl1 <- walktrap.community(g1, weights = E(g1)$weight, steps = 3)
+# length(cl1)
+
+#### Community Detection ####
+## walktrap 
+cl_wt.g2 <- walktrap.community(g2, weights = E(g2)$weight, steps = 3)
+cl_wt.g3 <- walktrap.community(g3, weights = E(g3)$weight, steps = 3)
+cl_wt.g4 <- walktrap.community(g4, weights = E(g4)$weight, steps = 3)
+
+## fastgreedy
+cl_fg.g2 <- fastgreedy.community(g2, weights = E(g2)$weight)
+cl_fg.g3 <- fastgreedy.community(g3, weights = E(g3)$weight)
+cl_fg.g4 <- fastgreedy.community(g4, weights = E(g4)$weight)
+
+## spinglass
+cl_sg.g2 <- spinglass.community(g2, weights = E(g2)$weight)
+cl_sg.g3 <- spinglass.community(g3, weights = E(g3)$weight)
+cl_sg.g4 <- spinglass.community(g4, weights = E(g4)$weight)
+
+## leading.eigenvector
+cl_eigen.g2 <- leading.eigenvector.community(g2, weights = E(g2)$weight, options = list(maxiter = 5000))
+cl_eigen.g3 <- leading.eigenvector.community(g3, weights = E(g3)$weight)
+cl_eigen.g4 <- leading.eigenvector.community(g4, weights = E(g4)$weight)
+
+## infomap
+cl_info.g2 <- infomap.community(g2, e.weights = E(g2)$weight)
+cl_info.g3 <- infomap.community(g3, e.weights = E(g3)$weight)
+cl_info.g4 <- infomap.community(g4, e.weights = E(g4)$weight)
+
+## save the plots
+pdf("p_communities.pdf")
+plot_cl(g2, cl_wt.g2,
+        # display labels for nodes w/ high betweenness
+        ifelse(betweenness(g2) >= 10000, V(g2)$name, NA))
+title(main = "Communities Identified by the Walktrap Algorithm", sub = "Threshold: Degree Centrality > Mean(Degree)")
+plot_cl(g2, cl_fg.g2,
+        ifelse(betweenness(g2) >= 10000, V(g2)$name, NA))
+title(main = "Communities Identified by the Fast Greedy Algorithm", sub = "Threshold: Degree Centrality > Mean(Degree)")
+plot_cl(g2, cl_sg.g2,
+        ifelse(betweenness(g2) >= 10000, V(g2)$name, NA))
+title(main = "Communities Identified by the Spinglass Algorithm", sub = "Threshold: Degree Centrality > Mean(Degree)")
+plot_cl(g2, cl_eigen.g2,
+        ifelse(betweenness(g2) >= 10000, V(g2)$name, NA))
+title(main = "Communities Identified by the Leading Eigenvector Algorithm", sub = "Threshold: Degree Centrality > Mean(Degree)")
+plot_cl(g2, cl_info.g2,
+        ifelse(betweenness(g2) >= 10000, V(g2)$name, NA))
+title(main = "Communities Identified by the Infomap Algorithm", sub = "Threshold: Degree Centrality > Mean(Degree)")
+
+plot_cl(g3, cl_wt.g3, V(g3)$name)
+title(main = "Communities Identified by the Walktrap Algorithm", sub = "Threshold: Degree Centrality > Mean(Degree) + 1SD(Degree)")
+plot_cl(g3, cl_fg.g3, V(g3)$name)
+title(main = "Communities Identified by the Fast Greedy Algorithm", sub = "Threshold: Degree Centrality > Mean(Degree) + 1SD(Degree)")
+plot_cl(g3, cl_sg.g3,V(g3)$name)
+title(main = "Communities Identified by the Spinglass Algorithm", sub = "Threshold: Degree Centrality > Mean(Degree) + 1SD(Degree)")
+plot_cl(g3, cl_eigen.g3,V(g3)$name)
+title(main = "Communities Identified by the Leading Eigenvector Algorithm", sub = "Threshold: Degree Centrality > Mean(Degree) + 1SD(Degree)")
+plot_cl(g3, cl_info.g3,V(g3)$name)
+title(main = "Communities Identified by the Infomap Algorithm", sub = "Threshold: Degree Centrality > Mean(Degree) + 1SD(Degree)")
+
+# plot_cl(g4, cl_wt.g4,V(g4)$name)
+# title(main = "Communities Identified by the Walktrap Algorithm", sub = "Threshold: Degree Centrality > Mean(Degree) + 2SD(Degree)")
+# plot_cl(g4, cl_fg.g4,V(g4)$name)
+# title(main = "Communities Identified by the Fast Greedy Algorithm", sub = "Threshold: Degree Centrality > Mean(Degree) + 2SD(Degree)")
+# plot_cl(g4, cl_sg.g4,V(g4)$name)
+# title(main = "Communities Identified by the Spinglass Algorithm", sub = "Threshold: Degree Centrality > Mean(Degree) + 2SD(Degree)")
+# plot_cl(g4, cl_eigen.g4,V(g4)$name)
+# title(main = "Communities Identified by the Leading Eigenvector Algorithm", sub = "Threshold: Degree Centrality > Mean(Degree) + 2SD(Degree)")
+# plot_cl(g4, cl_info.g4,V(g4)$name)
+# title(main = "Communities Identified by the Infomap Algorithm", sub = "Threshold: Degree Centrality > Mean(Degree) + 2SD(Degree)")
+dev.off()
+
+# nodal_attr <- node_attr(g2) %>% 
+#         mutate(walktrap = cl_wt.g2$membership,
+#                fastgreedy = cl_fg.g2$membership,
+#                spinglass = cl_sg.g2$membership,
+#                leading.eigenvector = cl_eigen.g2$membership,
+#                infomap = cl_info.g2$membership) 
+# write.csv(nodal_attr, "community identification.csv")
+```
+
+#### 3.3 Community Detection - Organizations
+
+```{r}
+# walktrap
+cl_wt.g2o <- walktrap.community(g2o, weights = E(g2o)$weight, steps = 3)
+cl_wt.g3o <- walktrap.community(g3o, weights = E(g3o)$weight, steps = 3)
+cl_wt.g4o <- walktrap.community(g4o, weights = E(g4o)$weight, steps = 3)
+cl_wt.g5o <- walktrap.community(g5o, weights = E(g5o)$weight, steps = 3)
+
+#spinglass
+cl_sg.g2o <- spinglass.community(g2o, weights = E(g2o)$weight) 
+cl_sg.g4o <- spinglass.community(g4o, weights = E(g4o)$weight)
+
+# leading eigenvector
+cl_eigen.g2o <- leading.eigenvector.community(g2o, weights = E(g2o)$weight, options = list( maxiter = 7000) ) 
+cl_eigen.g4o <- leading.eigenvector.community(g4o, weights = E(g4o)$weight, options = list( maxiter = 7000))
+
+# infomap
+cl_info.g2o <- infomap.community(g2o, e.weights = E(g2o)$weight)
+cl_info.g4o <- infomap.community(g4o, e.weights = E(g4o)$weight)
+
+## save the plots
+pdf("o_communities.pdf")
+plot_cl(g2o, cl_wt.g2o,
+        # display labels for nodes w/ high betweenness
+        ifelse(betweenness(g2o) >= 10000, V(g2o)$name, NA))
+title(main = "Communities Identified by the Walktrap Algorithm")
+
+# plot_cl(g2o, cl_fg.g2o,
+#         ifelse(betweenness(g2o) >= 10000, V(g2o)$name, NA))
+# title(main = "Communities Identified by the Fast Greedy Algorithm")
+
+plot_cl(g2o, cl_sg.g2o,
+        ifelse(betweenness(g2o) >= 10000, V(g2o)$name, NA))
+title(main = "Communities Identified by the Spinglass Algorithm", sub = "Threshold: Degree Centrality > Mean(Degree)")
+
+plot_cl(g2o, cl_eigen.g2o,
+        ifelse(betweenness(g2o) >= 10000, V(g2o)$name, NA))
+title(main = "Communities Identified by the Leading Eigenvector Algorithm", sub = "Threshold: Degree Centrality > Mean(Degree)")
+
+plot_cl(g2o, cl_info.g2o,
+        ifelse(betweenness(g2o) >= 10000, V(g2o)$name, NA))
+title(main = "Communities Identified by the Infomap Algorithm", sub = "Threshold: Degree Centrality > Mean(Degree)")
+
+plot_cl(g3o, cl_wt.g3o,
+        ifelse(betweenness(g3o) >= summary(betweenness(g3o))[3]*2, V(g3o)$name, NA))
+title(main = "Communities Identified by the Walktrap Algorithm", sub = "Threshold: Degree Centrality > Mean(Degree) + 1SD(Degree)")
+
+plot_cl(g5o, cl_wt.g5o,#V(g5o)$name)
+                ifelse(betweenness(g5o) >= summary(betweenness(g5o))[2], V(g5o)$name, NA))
+title(main = "Communities Identified by the Walktrap Algorithm", sub = "Threshold: Degree Centrality > Mean(Degree) + 1.5SD(Degree)")
+
+plot_cl(g4o, cl_wt.g4o,#V(g4o)$name)
+        ifelse(betweenness(g4o) >= summary(betweenness(g4o))[2], V(g4o)$name, NA))
+title(main = "Communities Identified by the Walktrap Algorithm", sub = "Threshold: Degree Centrality > Mean(Degree) + 2SD(Degree)")
+
+plot_cl(g4o, cl_fg.g4o,#V(g4o)$name)
+                ifelse(betweenness(g4o) >= summary(betweenness(g4o))[2], V(g4o)$name, NA))
+title(main = "Communities Identified by the Fast Greedy Algorithm", sub = "Threshold: Degree Centrality > Mean(Degree) + 2SD(Degree)")
+
+plot_cl(g4o, cl_sg.g4o,#V(g4o)$name)
+                ifelse(betweenness(g4o) >= summary(betweenness(g4o))[2], V(g4o)$name, NA))
+title(main = "Communities Identified by the Spinglass Algorithm", sub = "Threshold: Degree Centrality > Mean(Degree) + 2SD(Degree)")
+
+plot_cl(g4o, cl_eigen.g4o,#V(g4o)$name)
+        ifelse(betweenness(g4o) >= summary(betweenness(g4o))[2], V(g4o)$name, NA))
+title(main = "Communities Identified by the Leading Eigenvector Algorithm", sub = "Threshold: Degree Centrality > Mean(Degree) + 2SD(Degree)")
+
+plot_cl(g4o, cl_info.g4o,#V(g4o)$name)
+                ifelse(betweenness(g4o) >= summary(betweenness(g4o))[2], V(g4o)$name, NA))
+title(main = "Communities Identified by the Infomap Algorithm", sub = "Threshold: Degree Centrality > Mean(Degree) + 2SD(Degree)")
+
+dev.off()
+
+```
